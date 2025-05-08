@@ -1,0 +1,355 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk, scrolledtext
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+import os
+import threading
+import logging
+import sys
+
+# --- 基本日志设置 ---
+# 配置日志记录器，方便调试和追踪
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- 核心重投影逻辑 ---
+def reproject_raster(input_path, output_path, ref_crs, resampling_method):
+    """
+    将单个栅格文件重投影到参考坐标系。
+
+    Args:
+        input_path (str): 输入栅格文件的路径。
+        output_path (str): 保存重投影后栅格文件的路径。
+        ref_crs (rasterio.crs.CRS): 目标坐标系对象。
+        resampling_method (rasterio.warp.Resampling): 要使用的重采样方法。
+
+    Returns:
+        str: "成功" 或 "已跳过 (...)" 或 "错误: ..." 状态信息。
+    """
+    try:
+        with rasterio.open(input_path) as src:
+            # 检查是否真的需要重投影
+            if src.crs == ref_crs:
+                msg = f"跳过 {os.path.basename(input_path)}: 坐标系已是目标 CRS ({ref_crs.to_string()})。"
+                logging.info(msg)
+                # 如果需要，可以选择复制文件，或者直接跳过
+                # import shutil
+                # shutil.copy(input_path, output_path)
+                return f"已跳过 (坐标系相同)" # 指示已跳过
+
+            logging.info(f"开始重投影 {os.path.basename(input_path)} 从 {src.crs.to_string()} 到 {ref_crs.to_string()}")
+
+            # 计算在目标坐标系下的变换参数和栅格尺寸
+            transform, width, height = calculate_default_transform(
+                src.crs, ref_crs, src.width, src.height, *src.bounds)
+
+            # 复制元数据并更新相关部分
+            kwargs = src.meta.copy()
+            kwargs.update({
+                'crs': ref_crs,
+                'transform': transform,
+                'width': width,
+                'height': height,
+                'driver': 'GTiff', # 确保输出是 GeoTIFF 格式
+                'compress': 'lzw' # 可选：添加 LZW 压缩
+            })
+
+            # 执行重投影
+            with rasterio.open(output_path, 'w', **kwargs) as dst:
+                for i in range(1, src.count + 1): # 处理每个波段
+                    reproject(
+                        source=rasterio.band(src, i),
+                        destination=rasterio.band(dst, i),
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=transform,
+                        dst_crs=ref_crs,
+                        resampling=resampling_method)
+        logging.info(f"成功重投影到 {os.path.basename(output_path)}")
+        return "成功"
+    except Exception as e:
+        logging.error(f"重投影 {os.path.basename(input_path)} 时发生错误: {e}", exc_info=True)
+        # 清理可能未完成的输出文件
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError as oe:
+                logging.warning(f"无法删除未完成的输出文件 {output_path}: {oe}")
+        return f"错误: {e}"
+
+# --- GUI 应用类 ---
+class ReprojectApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("GeoTIFF 栅格重投影工具")
+        master.geometry("700x600") # 调整窗口大小以适应中文
+
+        self.ref_file = tk.StringVar()
+        self.ref_crs = None
+        self.ref_crs_str = tk.StringVar(value="基准坐标系: 未选择")
+        self.input_files = []
+        self.output_dir = tk.StringVar()
+        # 定义重采样方法及其对应的 rasterio 枚举值
+        self.resampling_methods = {
+            "最近邻法 (Nearest Neighbor)": Resampling.nearest, # 适用于分类数据 (如土地覆盖)
+            "双线性插值 (Bilinear)": Resampling.bilinear,       # 适用于连续数据 (如高程)
+            "三次卷积插值 (Cubic)": Resampling.cubic,
+            "三次样条插值 (Cubic Spline)": Resampling.cubic_spline,
+            "Lanczos 插值": Resampling.lanczos,
+            "平均值 (Average)": Resampling.average,
+            "众数 (Mode)": Resampling.mode,
+            # 如果需要可以添加其他方法
+        }
+        # 设置默认重采样方法
+        self.selected_resampling = tk.StringVar(value="最近邻法 (Nearest Neighbor)")
+
+        # --- GUI 布局 ---
+        frame = ttk.Frame(master, padding="10")
+        frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        master.columnconfigure(0, weight=1)
+        master.rowconfigure(0, weight=1)
+
+        # 基准文件选择区域
+        ttk.Label(frame, text="1. 选择基准 GeoTIFF 文件:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        ref_entry = ttk.Entry(frame, textvariable=self.ref_file, width=70) # 增加宽度
+        ref_entry.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=(0, 5))
+        ref_button = ttk.Button(frame, text="浏览...", command=self.select_ref_file)
+        ref_button.grid(row=1, column=2, sticky=tk.W)
+        ref_crs_label = ttk.Label(frame, textvariable=self.ref_crs_str, foreground="blue")
+        ref_crs_label.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(5, 10))
+
+        # 输入文件选择区域
+        ttk.Label(frame, text="2. 选择要重投影的 GeoTIFF 文件 (可多选):").grid(row=3, column=0, sticky=tk.W, pady=(5, 5))
+        self.input_listbox = tk.Listbox(frame, selectmode=tk.EXTENDED, height=8, width=70) # 增加高度和宽度
+        self.input_listbox.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
+        input_scrollbar_y = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.input_listbox.yview)
+        input_scrollbar_y.grid(row=4, column=1, sticky=(tk.N, tk.S, tk.E), padx=(0,5)) # 放在列合并内部的右侧
+        self.input_listbox['yscrollcommand'] = input_scrollbar_y.set
+        input_scrollbar_x = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self.input_listbox.xview)
+        input_scrollbar_x.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=(0,5)) # 添加水平滚动条
+        self.input_listbox['xscrollcommand'] = input_scrollbar_x.set
+        input_button = ttk.Button(frame, text="浏览...", command=self.select_input_files)
+        input_button.grid(row=4, column=2, sticky=(tk.W, tk.N), padx=(5,0))
+
+
+        # 输出目录选择区域
+        ttk.Label(frame, text="3. 选择输出目录:").grid(row=6, column=0, sticky=tk.W, pady=(10, 5))
+        output_entry = ttk.Entry(frame, textvariable=self.output_dir, width=70) # 增加宽度
+        output_entry.grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=(0, 5))
+        output_button = ttk.Button(frame, text="浏览...", command=self.select_output_dir)
+        output_button.grid(row=7, column=2, sticky=tk.W, padx=(5,0))
+
+        # 重采样方法选择区域
+        ttk.Label(frame, text="4. 选择重采样方法:").grid(row=8, column=0, sticky=tk.W, pady=(10, 5))
+        resampling_combo = ttk.Combobox(frame, textvariable=self.selected_resampling,
+                                        values=list(self.resampling_methods.keys()), state="readonly", width=30) # 增加下拉框宽度
+        resampling_combo.grid(row=8, column=1, sticky=tk.W, pady=(10, 5), padx=(0, 5))
+        ttk.Label(frame, text="(分类数据选'最近邻', 连续数据选'双线性'/'三次卷积'等)").grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=(0,10), padx=5)
+
+
+        # 执行按钮
+        self.run_button = ttk.Button(frame, text="开始重投影", command=self.start_reprojection_thread)
+        self.run_button.grid(row=10, column=0, columnspan=3, pady=(10, 10))
+
+        # 状态日志区域
+        ttk.Label(frame, text="状态日志:").grid(row=11, column=0, sticky=tk.W, pady=(10, 5))
+        self.status_text = scrolledtext.ScrolledText(frame, height=10, width=85, wrap=tk.WORD, state=tk.DISABLED) # 增加高度和宽度
+        self.status_text.grid(row=12, column=0, columnspan=3, sticky=(tk.W, tk.E))
+
+        # 配置列/行权重以适应窗口缩放
+        frame.columnconfigure(0, weight=1)
+        # frame.columnconfigure(1, weight=1) # 调整权重，让第一列更宽
+        frame.columnconfigure(1, weight=0) # 第二列（路径输入框旁边的按钮）不需要扩展
+        frame.columnconfigure(2, weight=0) # 第三列（浏览按钮）不需要扩展
+
+
+    def log_status(self, message, level="INFO"):
+        """
+        以线程安全的方式向状态文本区域追加消息。
+        同时也会使用 logging 模块记录日志。
+        """
+        def _update():
+            self.status_text.config(state=tk.NORMAL) # 解锁以编辑
+            self.status_text.insert(tk.END, f"[{level}] {message}\n")
+            self.status_text.see(tk.END) # 滚动到底部
+            self.status_text.config(state=tk.DISABLED) # 重新锁定
+        # 使用 'after' 安排 GUI 更新在主线程中执行
+        self.master.after(0, _update)
+        # 同时通过 logging 记录到控制台或文件
+        if level == "ERROR":
+            logging.error(message)
+        elif level == "WARN":
+            logging.warning(message)
+        else:
+            logging.info(message)
+
+
+    def select_ref_file(self):
+        """打开对话框选择基准 GeoTIFF 文件。"""
+        filepath = filedialog.askopenfilename(
+            title="选择基准 GeoTIFF 文件",
+            filetypes=[("GeoTIFF 栅格文件", "*.tif *.tiff")]
+        )
+        if filepath:
+            try:
+                with rasterio.open(filepath) as src:
+                    if not src.crs:
+                        messagebox.showerror("错误", f"基准文件没有坐标系信息:\n{filepath}")
+                        self.ref_crs = None
+                        self.ref_crs_str.set("基准坐标系: 错误 - 未找到CRS")
+                        return
+                    self.ref_file.set(filepath)
+                    self.ref_crs = src.crs # 存储 CRS 对象
+                    try:
+                        # 尝试获取易于阅读的 CRS 字符串（例如 EPSG 代码）
+                        if self.ref_crs.is_epsg_code:
+                             crs_string = f"EPSG:{self.ref_crs.to_epsg()}"
+                        else:
+                             crs_string = self.ref_crs.to_string() # Proj4 或 WKT 字符串
+                    except Exception:
+                        crs_string = self.ref_crs.to_wkt() # 作为备选
+                    self.ref_crs_str.set(f"基准坐标系: {crs_string}")
+                    self.log_status(f"已选择基准文件: {os.path.basename(filepath)}")
+                    self.log_status(f"检测到基准坐标系: {crs_string}")
+            except Exception as e:
+                self.ref_crs = None
+                self.ref_crs_str.set("基准坐标系: 读取文件出错")
+                messagebox.showerror("错误", f"读取基准文件或坐标系失败:\n{filepath}\n\n错误详情: {e}")
+                self.log_status(f"读取基准文件 {filepath} 出错: {e}", "ERROR")
+
+    def select_input_files(self):
+        """打开对话框选择一个或多个输入的 GeoTIFF 文件。"""
+        # 使用 askopenfilenames (注意末尾的 's') 来允许多选
+        filepaths = filedialog.askopenfilenames(
+            title="选择要重投影的 GeoTIFF 文件",
+            filetypes=[("GeoTIFF 栅格文件", "*.tif *.tiff")]
+        )
+        if filepaths:
+            self.input_files = filepaths # 存储文件路径元组
+            self.input_listbox.delete(0, tk.END) # 清空之前的列表
+            self.log_status(f"已选择 {len(filepaths)} 个输入文件:")
+            for fp in filepaths:
+                self.input_listbox.insert(tk.END, fp) # 显示完整路径可能更好
+                # self.input_listbox.insert(tk.END, os.path.basename(fp)) # 或者只显示文件名
+                self.log_status(f"  - {os.path.basename(fp)}")
+
+
+    def select_output_dir(self):
+        """打开对话框选择输出目录。"""
+        dirpath = filedialog.askdirectory(title="选择输出目录")
+        if dirpath:
+            self.output_dir.set(dirpath)
+            self.log_status(f"输出目录已设置为: {dirpath}")
+
+    def start_reprojection_thread(self):
+        """验证输入并启动一个新的线程来执行重投影过程。"""
+        # --- 输入验证 ---
+        if not self.ref_file.get() or self.ref_crs is None:
+            messagebox.showerror("错误", "请先选择一个有效的、带有坐标系的基准 GeoTIFF 文件。")
+            return
+        if not self.input_files:
+            messagebox.showerror("错误", "请至少选择一个需要重投影的 GeoTIFF 文件。")
+            return
+        output_directory = self.output_dir.get()
+        if not output_directory or not os.path.isdir(output_directory):
+             messagebox.showerror("错误", "请选择一个有效的输出目录。")
+             return
+        selected_method_name = self.selected_resampling.get()
+        if not selected_method_name:
+             messagebox.showerror("错误", "请选择一个重采样方法。")
+             return
+
+        resampling_method_enum = self.resampling_methods[selected_method_name]
+        ref_crs_obj = self.ref_crs # 使用存储的 CRS 对象
+
+        # 禁用按钮, 清空状态区, 启动线程
+        self.run_button.config(state=tk.DISABLED)
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.delete('1.0', tk.END) # 清空状态区内容
+        self.status_text.config(state=tk.DISABLED)
+        self.log_status("--- 开始重投影处理 ---")
+        try:
+            if ref_crs_obj.is_epsg_code:
+                 crs_str = f"EPSG:{ref_crs_obj.to_epsg()}"
+            else:
+                 crs_str = ref_crs_obj.to_string()
+        except Exception:
+            crs_str = ref_crs_obj.to_wkt()
+        self.log_status(f"目标坐标系: {crs_str}")
+        self.log_status(f"重采样方法: {selected_method_name}")
+        self.log_status(f"输出目录: {output_directory}")
+
+        # 创建并启动处理线程
+        # 使用 list(self.input_files) 确保传递的是列表副本
+        self.processing_thread = threading.Thread(
+            target=self._run_processing,
+            args=(list(self.input_files), output_directory, ref_crs_obj, resampling_method_enum),
+            daemon=True # 设置为守护线程，允许主程序在线程未结束时退出（可选）
+        )
+        self.processing_thread.start()
+
+    def _run_processing(self, input_paths, output_dir, target_crs, resampling_method):
+        """实际执行处理任务的函数，在独立的线程中运行。"""
+        total_files = len(input_paths)
+        success_count = 0
+        skipped_count = 0
+        error_count = 0
+
+        for i, input_path in enumerate(input_paths):
+            base_name = os.path.basename(input_path)
+            name, ext = os.path.splitext(base_name)
+            # 构建输出文件名，添加后缀
+            output_name = f"{name}_reprojected{ext}"
+            output_path = os.path.join(output_dir, output_name)
+
+            self.log_status(f"正在处理文件 {i+1}/{total_files}: {base_name}...")
+
+            # --- 处理输出文件已存在的情况 ---
+            if os.path.exists(output_path):
+                 # 简单的覆盖警告，可以根据需要做得更复杂（例如，跳过、重命名）
+                 self.log_status(f"输出文件已存在，将覆盖: {output_name}", "WARN")
+                 # 如果需要，在这里添加更健壮的处理逻辑
+
+            # --- 执行重投影 ---
+            result = reproject_raster(input_path, output_path, target_crs, resampling_method)
+
+            # --- 记录结果 ---
+            if result == "成功":
+                self.log_status(f"  结果: 成功 -> {output_name}")
+                success_count += 1
+            elif result == "已跳过 (坐标系相同)":
+                 self.log_status(f"  结果: 已跳过 (坐标系相同)")
+                 skipped_count += 1
+            else: # 发生错误
+                 self.log_status(f"  结果: 失败 - {base_name}。原因: {result}", "ERROR")
+                 error_count += 1
+
+        # --- 输出最终总结 ---
+        self.log_status("--- 重投影处理完成 ---")
+        summary = f"总结: 共 {total_files} 个文件, {success_count} 个成功, {skipped_count} 个跳过, {error_count} 个失败。"
+        self.log_status(summary)
+
+        # --- 在主线程中重新启用按钮和显示消息框 ---
+        # 必须使用 'after' 来确保线程安全地操作 GUI 组件
+        self.master.after(0, lambda: self.run_button.config(state=tk.NORMAL))
+
+        # 根据结果显示不同的最终提示消息
+        if error_count > 0:
+            self.master.after(0, lambda: messagebox.showwarning("处理完成", f"{summary}\n请检查状态日志获取详细错误信息。"))
+        elif success_count == 0 and skipped_count > 0:
+             self.master.after(0, lambda: messagebox.showinfo("处理完成", f"{summary}\n所有文件都已是目标坐标系或处理失败。"))
+        else:
+            self.master.after(0, lambda: messagebox.showinfo("处理完成", summary))
+
+
+# --- 主程序入口 ---
+if __name__ == "__main__":
+    # 尝试为 Windows 设置 DPI 感知，改善高分屏显示效果
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass # 在非 Windows 或没有相应库时忽略
+
+    root = tk.Tk()
+    app = ReprojectApp(root)
+    root.mainloop()
